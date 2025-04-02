@@ -170,6 +170,13 @@ extern void _st_md_cxt_restore(_st_jmp_buf_t env, int val);
         MD_GET_SP(_thread) = (long) (_sp);         \
         ST_END_MACRO
 
+    /*
+     * Check for io_uring support
+     */
+    #if defined(__has_include) && __has_include(<liburing.h>) && !defined(MD_HAVE_IO_URING)
+        #define MD_HAVE_IO_URING
+    #endif
+
 #elif defined (CYGWIN64)
 
     // For CYGWIN64, build SRS on Windows.
