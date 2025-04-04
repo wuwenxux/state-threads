@@ -701,7 +701,7 @@ ST_HIDDEN void _st_kq_pollset_del(struct pollfd *pds, int npds)
 
     /*
      * It's OK if deleting fails because a descriptor will either be
-     * closed or fire only once (we set EV_ONESHOT flag).
+     * closed or deleted in dispatch function after it fires.
      */
     _st_kq_data->dellist_cnt = 0;
     for (pd = pds; pd < epd; pd++) {
@@ -806,28 +806,11 @@ ST_HIDDEN void _st_kq_dispatch(void)
             if (notify) {
                 ST_REMOVE_LINK(&pq->links);
                 pq->on_ioq = 0;
-                for (pds = pq->pds; pds < epds; pds++) {
-                    osfd = pds->fd;
-                    events = pds->events;
-                    /*
-                     * We set EV_ONESHOT flag so we only need to delete
-                     * descriptor if it didn't fire.
-                     */
-                    if ((events & POLLIN) && (--_ST_KQ_READ_CNT(osfd) == 0) && ((_ST_KQ_REVENTS(osfd) & POLLIN) == 0)) {
-                        memset(&kev, 0, sizeof(kev));
-                        kev.ident = osfd;
-                        kev.filter = EVFILT_READ;
-                        kev.flags = EV_DELETE;
-                        _st_kq_dellist_add(&kev);
-                    }
-                    if ((events & POLLOUT) && (--_ST_KQ_WRITE_CNT(osfd) == 0) && ((_ST_KQ_REVENTS(osfd) & POLLOUT) == 0)) {
-                        memset(&kev, 0, sizeof(kev));
-                        kev.ident = osfd;
-                        kev.filter = EVFILT_WRITE;
-                        kev.flags = EV_DELETE;
-                        _st_kq_dellist_add(&kev);
-                    }
-                }
+                /*
+                 * Here we will only delete/modify descriptors that
+                 * didn't fire (see comments in _st_kq_pollset_del()).
+                 */
+                _st_kq_pollset_del(pq->pds, pq->npds);
 
                 if (pq->thread->flags & _ST_FL_ON_SLEEPQ)
                     _ST_DEL_SLEEPQ(pq->thread);
@@ -1407,13 +1390,12 @@ ST_HIDDEN int _st_io_uring_addlist_expand(int avail)
     _st_io_uring_data->ring_size = n;
 
     /*
-     * Try to expand the result event list too
+     * Try to expand the completion queue entries too
      * (although we don't have to do it).
      */
-    ptr = (struct io_uring_sqe *)realloc(_st_io_uring_data->sqes, n * sizeof(struct io_uring_sqe));
-    if (ptr) {
-        _st_io_uring_data->sqes = ptr;
-        _st_io_uring_data->ring_size = n;
+    struct io_uring_cqe *cqe_ptr = (struct io_uring_cqe *)realloc(_st_io_uring_data->cqes, n * sizeof(struct io_uring_cqe));
+    if (cqe_ptr) {
+        _st_io_uring_data->cqes = cqe_ptr;
     }
 
     return 0;
@@ -1517,7 +1499,7 @@ ST_HIDDEN void _st_io_uring_pollset_del(struct pollfd *pds, int npds)
     for (pd = pds; pd < epd; pd++) {
         if ((pd->events & POLLIN) && (--_ST_IO_URING_READ_CNT(pd->fd) == 0)) {
             memset(&sqe, 0, sizeof(sqe));
-            sqe.opcode = IORING_OP_POLL_ADD;
+            sqe.opcode = IORING_OP_POLL_REMOVE;
             sqe.fd = pd->fd;
             sqe.off = 0;
             sqe.addr = (uint64_t)&_st_io_uring_data->fd_data[pd->fd].revents;
@@ -1526,7 +1508,7 @@ ST_HIDDEN void _st_io_uring_pollset_del(struct pollfd *pds, int npds)
         }
         if ((pd->events & POLLOUT) && (--_ST_IO_URING_WRITE_CNT(pd->fd) == 0)) {
             memset(&sqe, 0, sizeof(sqe));
-            sqe.opcode = IORING_OP_POLL_ADD;
+            sqe.opcode = IORING_OP_POLL_REMOVE;
             sqe.fd = pd->fd;
             sqe.off = 0;
             sqe.addr = (uint64_t)&_st_io_uring_data->fd_data[pd->fd].revents;
@@ -1555,7 +1537,7 @@ ST_HIDDEN void _st_io_uring_dispatch(void)
     _st_pollq_t *pq;
     struct pollfd *pds, *epds;
     struct io_uring_cqe *cqe;
-    int timeout, nfd, i, osfd, notify;
+    int timeout, nfd, osfd, notify;
     int events, op;
     short revents;
 
@@ -1595,13 +1577,12 @@ ST_HIDDEN void _st_io_uring_dispatch(void)
     #endif
 
     if (nfd > 0) {
-        for (i = 0; i < nfd; i++) {
-            osfd = cqe->user_data;
-            _ST_IO_URING_REVENTS(osfd) = cqe->res;
-            if (_ST_IO_URING_REVENTS(osfd) & (IORING_POLL_ADD_MULTI)) {
-                /* Also set I/O bits on error */
-                _ST_IO_URING_REVENTS(osfd) |= _ST_IO_URING_EVENTS(osfd);
-            }
+        /* 处理单个完成事件 */
+        osfd = cqe->user_data;
+        _ST_IO_URING_REVENTS(osfd) = cqe->res;
+        if (_ST_IO_URING_REVENTS(osfd) & (IORING_POLL_ADD_MULTI)) {
+            /* Also set I/O bits on error */
+            _ST_IO_URING_REVENTS(osfd) |= _ST_IO_URING_EVENTS(osfd);
         }
 
         for (q = _ST_IOQ.next; q != &_ST_IOQ; q = q->next) {
@@ -1642,17 +1623,18 @@ ST_HIDDEN void _st_io_uring_dispatch(void)
             }
         }
 
-        for (i = 0; i < nfd; i++) {
-            /* Delete/modify descriptors that fired */
-            osfd = cqe->user_data;
-            _ST_IO_URING_REVENTS(osfd) = 0;
-            events = _ST_IO_URING_EVENTS(osfd);
-            op = events ? IORING_OP_POLL_ADD : IORING_OP_POLL_REMOVE;
-            cqe->user_data = osfd;
-            if (io_uring_submit(_st_io_uring_data->ring) == 0 && op == IORING_OP_POLL_REMOVE) {
-                _st_io_uring_data->ring_cnt--;
-            }
+        /* 处理单个完成事件 */
+        osfd = cqe->user_data;
+        _ST_IO_URING_REVENTS(osfd) = 0;
+        events = _ST_IO_URING_EVENTS(osfd);
+        op = events ? IORING_OP_POLL_ADD : IORING_OP_POLL_REMOVE;
+        cqe->user_data = osfd;
+        if (io_uring_submit(_st_io_uring_data->ring) == 0 && op == IORING_OP_POLL_REMOVE) {
+            _st_io_uring_data->ring_cnt--;
         }
+        
+        /* 告知io_uring我们已经处理了这个完成事件 */
+        io_uring_cqe_seen(_st_io_uring_data->ring, cqe);
     }
 }
 
